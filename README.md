@@ -1,297 +1,371 @@
-# 
+# KG4EX-CogRE: 基于知识图谱嵌入的可解释习题推荐
 
-这份代码主要做两件事：
+本项目面向个性化习题推荐任务。整体思路是：先从学生历史作答序列中提取学习特征，再把学生、知识点和习题组织成知识图谱，随后使用知识图谱嵌入模型学习实体和关系向量，最后根据嵌入空间中的推理得分为每个学生生成推荐习题列表。
 
-第一，用训练好的嵌入向量给每个学生的候选习题打分，得到推荐列表。
+和普通的习题推荐方法相比，本项目关注两件事。第一，推荐结果本身要尽量准确，模型要能判断学生是否适合做某道题。第二，推荐结果要有学习收益，也就是推荐列表要覆盖学生后续真正需要补充的知识点，并且题目难度要落在学生当前能力附近。
 
-第二，在推荐列表上算三个指标：`ACC@N`、`NOV@N`、`ZPD-EMCC@N`。我们现在重点看 `ACC` 和 `EMCC`。
+因此，当前版本主要使用两个核心评价指标：`ACC@N` 和 `ZPD-EMCC@N`。其中，`ACC@N` 衡量模型预测掌握概率与客观 IRT 估计概率的一致性；`ZPD-EMCC@N` 衡量推荐列表对学生未来学习需求的期望覆盖收益。旧版的新颖性指标 `NOV@N` 在当前版本中不再作为主要指标。
 
-这里的 `N` 一般取 `10` 和 `20`，所以最后会打印 `ACC@10 / ACC@20 / EMCC@10 / EMCC@20`。
+---
 
-## 模型和训练这块
+## 1. 方法概览
 
-这一块主要对应 `model.py` 和 `run.py`。简单说，训练阶段是在学一套实体向量和关系向量；测试阶段再用这些向量给每个学生的候选习题打分。
-
-这次训练用的是 `CogRE` 模型，不是普通的 `TransE`。它还是知识图谱嵌入模型的思路：
+整个流程可以概括为五个阶段：
 
 ```text
-实体：学生、知识点、习题等
-关系：mlkc、pkc、exfr、rec 等
-目标：让真实三元组的分数更高，让负采样三元组的分数更低
+历史学习交互数据
+    ↓
+学生特征提取：MLKC / PKC / EFR
+    ↓
+知识图谱构建：student / concept / exercise / relation
+    ↓
+知识图谱嵌入训练：CogRE / TripleRE / TransE-ADV
+    ↓
+候选习题打分与评价：ACC@N / ZPD-EMCC@N
 ```
 
-### 1）CogRE 的模型结构
+前半部分的特征提取和知识图谱构建沿用了 KG4EER 的基本思想：从学生历史交互中提取知识点掌握程度、后续知识点出现概率和遗忘状态，再把这些特征转化成知识图谱中的显式关系。当前版本的主要改动集中在嵌入模型、候选习题打分方式和评价指标上。
 
-训练时会初始化两类参数：
+---
 
-```python
-entity_embedding   # 实体向量
-relation_embedding # 关系向量
-```
+## 2. 数据与符号说明
 
-这次指令里设置了：
-
-```text
--d 500
-```
-
-所以实体向量维度是：
+设学生集合为：
 
 $$
-entity\_dim = 500
+S=\{s_1,s_2,\ldots,s_{N_s}\}
 $$
 
-CogRE 会把一个关系向量拆成 4 段，所以关系向量维度是：
+习题集合为：
 
 $$
-relation\_dim = 4 \times 500 = 2000
+E=\{e_1,e_2,\ldots,e_{N_e}\}
 $$
 
-也就是：
+知识点集合为：
 
 $$
-r = [r_h, r_t, r_m, r_{res}]
+K=\{k_1,k_2,\ldots,k_{N_k}\}
 $$
 
-这里可以这么理解：
-
-```text
-r_h：控制头实体怎么被关系筛选
-r_t：控制尾实体怎么被关系筛选
-r_m：关系带来的平移项
-r_res：关系残差，用来补充门控强度
-```
-
-在模型里，头实体和尾实体不是直接相减，而是先做关系门控投影：
+`Q.txt` 是习题和知识点的关联矩阵：
 
 $$
-h' = h \odot (\sigma(r_h) + 0.2\sigma(r_{res}))
-$$
-
-$$
-t' = t \odot (\sigma(r_t) + 0.2\sigma(r_{res}))
-$$
-
-然后计算：
-
-$$
-diff = t' - (h' + r_m)
-$$
-
-CogRE 这里用了一个非对称惩罚，不是普通的 L1：
-
-$$
-penalty_j =
-\begin{cases}
-|diff_j|, & diff_j > 0 \\
-\alpha |diff_j|, & diff_j \le 0
+Q_{e,k}=\begin{cases}
+1, & \text{习题 } e \text{ 涉及知识点 } k \\
+0, & \text{否则}
 \end{cases}
 $$
 
-代码里：
+在代码中，一道习题 `ex_i` 涉及的知识点集合记为：
 
 $$
-\alpha = 0.4
+K_e=\{k \mid Q_{e,k}=1\}
 $$
 
-最后三元组分数是：
+本项目中的主要实体包括：
+
+```text
+uid*  : 学生实体
+kc*   : 知识点实体
+ex*   : 习题实体
+```
+
+主要关系包括：
+
+```text
+mlkc* : 学生对知识点的当前掌握程度
+pkc*  : 学生后续学习中对知识点的需求强度
+exfr* : 学生对历史习题相关内容的遗忘状态
+rec   : 学生和习题之间的推荐关系
+```
+
+三元组文件通常采用如下格式：
+
+```text
+head_entity    relation    tail_entity
+```
+
+例如：
+
+```text
+kc12    mlkc0.73    uid8
+kc12    pkc0.41     uid8
+ex233   exfr0.62    uid8
+uid8    rec         ex233
+```
+
+这些三元组会被 `generate_dict.py` 转换成实体字典和关系字典，并进一步用于图谱嵌入训练。
+
+---
+
+## 3. 学生特征提取
+
+特征提取模块的目标是把学生历史作答序列转化为可进入知识图谱的结构化关系。本项目主要使用三类学生学习特征。
+
+### 3.1 MLKC：知识点掌握程度
+
+`MLKC` 表示学生在当前时刻对某个知识点的掌握程度。对学生 $u$ 和知识点 $k$，记为：
+
+$$
+MLKC_{u,k}\in[0,1]
+$$
+
+数值越大，说明模型认为学生越可能掌握该知识点。该特征通常由知识追踪模型或序列模型根据学生历史作答记录得到。
+
+在知识图谱中，它会被离散化成关系形式，例如：
+
+```text
+kc12    mlkc0.73    uid8
+```
+
+含义是：学生 `uid8` 对知识点 `kc12` 的掌握程度约为 `0.73`。
+
+### 3.2 PKC：后续知识点需求概率
+
+`PKC` 表示某个知识点在学生后续学习中出现或被需要的概率。对学生 $u$ 和知识点 $k$，记为：
+
+$$
+PKC_{u,k}\in[0,1]
+$$
+
+它不是简单表示学生是否已经掌握某个知识点，而是表示这个知识点对学生后续学习任务的重要程度。在本项目的 `ZPD-EMCC` 指标中，`PKC` 会作为知识点学习收益的权重。
+
+在知识图谱中，对应关系例如：
+
+```text
+kc12    pkc0.41    uid8
+```
+
+含义是：知识点 `kc12` 对学生 `uid8` 后续学习的需求强度约为 `0.41`。
+
+### 3.3 EFR / EXFR：遗忘状态
+
+`EFR` 或 `EXFR` 表示学生对历史习题相关知识的遗忘状态。遗忘建模的直观依据是：学生并不会永久保持同一水平的知识掌握度，随着时间推移，已经学过的内容会产生遗忘。
+
+对学生 $u$ 和习题 $e$，遗忘状态可记为：
+
+$$
+EXFR_{u,e}\in[0,1]
+$$
+
+在知识图谱中，对应关系例如：
+
+```text
+ex233    exfr0.62    uid8
+```
+
+含义是：学生 `uid8` 对习题 `ex233` 相关内容的遗忘程度约为 `0.62`。
+
+---
+
+## 4. 知识图谱构建
+
+知识图谱用于把学生、知识点和习题放到统一的结构中。当前项目中，一条知识图谱三元组可以写成：
+
+$$
+(h,r,t)
+$$
+
+其中 $h$ 是头实体，$r$ 是关系，$t$ 是尾实体。
+
+本项目的图谱主要包含四类语义关系：
+
+| 关系类型 | 示例 | 含义 |
+|---|---|---|
+| `mlkc` | `kc12 mlkc0.73 uid8` | 学生对知识点的掌握程度 |
+| `pkc` | `kc12 pkc0.41 uid8` | 学生后续学习对知识点的需求 |
+| `exfr` | `ex233 exfr0.62 uid8` | 学生对历史习题相关内容的遗忘状态 |
+| `rec` | `uid8 rec ex233` | 学生和候选习题之间的推荐关系 |
+
+图谱构建完成后，所有实体和关系会被映射成整数 ID：
+
+```text
+entities.dict
+relations.dict
+```
+
+训练阶段的输入是 ID 化后的三元组。模型训练完成后，会保存：
+
+```text
+entity_embedding.npy
+relation_embedding.npy
+checkpoint
+config.json
+```
+
+测试阶段再加载这些嵌入向量，为每个学生计算候选习题分数。
+
+---
+
+## 5. CogRE 嵌入模型
+
+当前版本的核心模型是 `CogRE`。它仍然属于知识图谱嵌入模型，但相比普通 `TransE`，它不再简单使用：
+
+$$
+h+r\approx t
+$$
+
+而是对头实体和尾实体分别做关系门控投影，再计算非对称距离。
+
+### 5.1 参数维度
+
+训练时初始化两类参数：
+
+```python
+entity_embedding
+relation_embedding
+```
+
+若实体向量维度为：
+
+$$
+d=500
+$$
+
+则实体向量维度为：
+
+$$
+entity\_dim=d
+$$
+
+CogRE 将每个关系向量划分为四段：
+
+$$
+r=[r_h,r_t,r_m,r_{res}]
+$$
+
+所以关系向量维度为：
+
+$$
+relation\_dim=4d
+$$
+
+当 $d=500$ 时，关系向量维度为 `2000`。
+
+### 5.2 关系门控投影
+
+对三元组 $(h,r,t)$，先将关系向量拆分为：
+
+$$
+r_h,r_t,r_m,r_{res}
+$$
+
+头实体投影为：
+
+$$
+h'=h\odot\left(\sigma(r_h)+0.2\sigma(r_{res})\right)
+$$
+
+尾实体投影为：
+
+$$
+t'=t\odot\left(\sigma(r_t)+0.2\sigma(r_{res})\right)
+$$
+
+其中 $\odot$ 表示逐元素乘法，$\sigma(\cdot)$ 表示 Sigmoid 函数。
+
+随后计算方向差：
+
+$$
+diff=t'-(h'+r_m)
+$$
+
+这个方向必须和测试阶段保持一致。因为 CogRE 使用的是非对称距离，方向反过来会改变排序结果。
+
+### 5.3 非对称 L1 惩罚
+
+CogRE 使用非对称 L1 惩罚：
+
+$$
+penalty_j=
+\begin{cases}
+|diff_j|, & diff_j>0 \\
+\alpha |diff_j|, & diff_j\le 0
+\end{cases}
+$$
+
+当前代码中：
+
+$$
+\alpha=0.4
+$$
+
+最终三元组得分为：
 
 $$
 score(h,r,t)=\gamma-\sum_j penalty_j
 $$
 
-这次训练没有手动传 `-g`，所以 `gamma` 用的是 `run.py` 里的默认值：
+其中 $\gamma$ 是 margin 参数，默认值为：
+
+$$
+\gamma=12.0
+$$
+
+分数越高，说明三元组越可信。
+
+---
+
+## 6. 训练目标
+
+训练数据中的真实三元组作为正样本。负样本通过随机替换头实体或尾实体得到：
 
 ```text
--gamma = 12.0
+head-batch: 固定 relation 和 tail，替换 head
+tail-batch: 固定 head 和 relation，替换 tail
 ```
 
-直观理解就是：真实三元组希望距离小、分数高；错误三元组希望距离大、分数低。
+训练过程中，`BidirectionalOneShotIterator` 会在 head-batch 和 tail-batch 之间交替取 batch，使模型同时学习两种负采样方向。
 
-### 2）训练时怎么构造正负样本
+### 6.1 正负样本损失
 
-训练数据来自：
+对正样本分数 $s^+$，使用：
+
+$$
+L_{pos}=-\log\sigma(s^+)
+$$
+
+对负样本分数 $s^-$，使用：
+
+$$
+L_{neg}=-\log\sigma(-s^-)
+$$
+
+如果开启自对抗负采样，模型会给更难的负样本更高权重。负样本权重为：
+
+$$
+w_i=\frac{\exp(\alpha_s s_i^-)}{\sum_j \exp(\alpha_s s_j^-)}
+$$
+
+其中 $\alpha_s$ 是 adversarial temperature。最终负样本损失为加权形式：
+
+$$
+L_{neg}=-\sum_i w_i\log\sigma(-s_i^-)
+$$
+
+总损失为：
+
+$$
+L=\frac{L_{pos}+L_{neg}}{2}
+$$
+
+当前版本已经恢复原始 KGE 损失函数，没有加入额外的关系平滑损失或三元组加权损失。
+
+### 6.2 优化器和学习率
+
+训练使用 Adam 优化器：
 
 ```python
-akt_fpkc_h1_g08_triples.txt
+optimizer = torch.optim.Adam(..., lr=args.learning_rate)
 ```
 
-每条真实三元组是正样本。负样本通过随机替换头实体或尾实体得到：
-
-```text
-head-batch：替换头实体
-tail-batch：替换尾实体
-```
-
-训练时会在 `head-batch` 和 `tail-batch` 之间交替取数据，这样不会只学会一边的替换。
-
-这次训练指令里：
-
-```text
--b 512
--n 128
-```
-
-意思是：
-
-```text
-batch size = 512
-每个正样本配 128 个负样本
-```
-
-### 3）损失函数和优化器
-
-优化器用的是 Adam：
-
-```python
-optimizer = torch.optim.Adam(..., lr=0.001)
-```
-
-因为训练指令里写的是：
-
-```text
--lr 0.001
-```
-
-训练目标大概是：
-
-```text
-正样本分数越高越好
-负样本分数越低越好
-```
-
-代码里对正样本用了：
-
-$$
--\log \sigma(score_{pos})
-$$
-
-对负样本用了：
-
-$$
--\log \sigma(-score_{neg})
-$$
-
-因为指令里加了：
-
-```text
--adv
-```
-
-所以负样本不是简单平均，而是用了自对抗负采样。也就是说，模型会更关注那些“看起来更像真的”的负样本，因为这些负样本更难分。
-
-代码形式大概是：
-
-```python
-negative_score = (
-    F.softmax(negative_score * args.adversarial_temperature, dim=1).detach()
-    * F.logsigmoid(-negative_score)
-).sum(dim=1)
-```
-
-最后正样本损失和负样本损失取平均：
-
-$$
-loss = \frac{loss_{pos}+loss_{neg}}{2}
-$$
-
-这次训练里：
-
-```text
--r 0.00
-```
-
-所以没有额外正则项。
-
-### 4）学习率和训练步数
-
-这次最大训练步数是：
-
-```text
---max_steps 30000
-```
-
-如果没有手动设置 `warm_up_steps`，代码默认：
-
-$$
-warm\_up\_steps = \frac{max\_steps}{2} = 15000
-$$
-
-也就是说，训练到 15000 步左右时，学习率会除以 10：
-
-```text
-0.001 -> 0.0001
-```
-
-模型会定期保存 checkpoint。代码默认每 100 步保存一次：
-
-```text
---save_checkpoint_steps 100
-```
-
-### 5）随机种子会不会带来偶然性
-
-会的。当前这份 `run.py` 里没有固定随机种子，所以每次重新训练，即使用同一条训练指令，结果也可能有一点差异。
-
-主要随机性来自这些地方：
-
-```text
-实体向量和关系向量的随机初始化
-DataLoader 的 shuffle
-负采样时随机选实体
-GPU 上某些算子的非确定性
-```
-
-所以严格来说：
-
-```text
-同一份代码 + 同一份数据 + 同一条训练指令
-不一定每次训练结果完全一样
-```
-
-如果只是加载同一个已经训练好的 checkpoint 去测试，结果一般会稳定；但如果是重新训练模型，结果就可能波动。
-
-比较严谨的做法是跑多个 seed，比如 3 个或 5 个，然后汇报：
-
-$$
-mean \pm std
-$$
-
-如果想先固定随机种子，可以在 `run.py` 里加类似这样的函数：
-
-```python
-def set_seed(seed=2024):
-    import os
-    import random
-    import numpy as np
-    import torch
-
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-```
-
-然后在 `main(parse_args())` 前调用：
-
-```python
-set_seed(2024)
-```
-
-不过就算固定 seed，GPU 环境、库版本、多线程设置不一样，也可能有很小差异。所以论文或者报告里最好还是用多次实验的均值和标准差。
-
-### 6）本次训练指令
-
-本次训练直接运行：
+常用训练指令如下：
 
 ```bash
 python run.py --do_train --cuda \
   --data_path ../data/algebra2005 \
-  --save_path ./models/algebra2005/cog6 \
+  --save_path ./models/algebra2005/cog_h5_g09 \
   --model CogRE \
   -b 512 \
   -n 128 \
@@ -304,537 +378,511 @@ python run.py --do_train --cuda \
   -adv
 ```
 
-各参数对应的意思：
+参数说明：
+
+| 参数 | 含义 |
+|---|---|
+| `--do_train` | 开启训练模式 |
+| `--cuda` | 使用 GPU |
+| `--data_path` | 数据目录 |
+| `--save_path` | 模型保存目录 |
+| `--model CogRE` | 使用 CogRE 模型 |
+| `-b 512` | batch size |
+| `-n 128` | 每个正样本对应的负样本数量 |
+| `-d 500` | 实体向量维度 |
+| `-r 0.00` | 正则系数 |
+| `-lr 0.001` | 学习率 |
+| `-cpu 20` | DataLoader 使用的 CPU worker 参数 |
+| `-3u 1.0` | TripleRE 参数，CogRE 下基本不参与计算 |
+| `--max_steps 30000` | 最大训练步数 |
+| `-adv` | 开启自对抗负采样 |
+
+如果希望减少训练过程中的磁盘写入，可以增大保存间隔：
+
+```bash
+--save_checkpoint_steps 5000 --log_steps 500
+```
+
+---
+
+## 7. 候选习题打分
+
+训练完成后，测试脚本会加载：
 
 ```text
---do_train：训练模式
---cuda：用 GPU 训练
---data_path：数据集路径
---save_path：模型保存路径
---model CogRE：使用 CogRE 模型
--b 512：batch size 是 512
--n 128：每个正样本采 128 个负样本
--d 500：实体向量维度是 500
--r 0.00：不加正则
--lr 0.001：学习率是 0.001
--cpu 20：DataLoader 使用的 CPU 线程参数
--3u 1.0：TripleRE 用的参数，这次 CogRE 基本用不上
---max_steps 30000：训练 30000 步
--adv：开启自对抗负采样
+entity_embedding.npy
+relation_embedding.npy
+entities.dict
+relations.dict
+Q.txt
+test triples
 ```
 
-需要注意一点：`run.py` 里训练三元组文件目前是写死的：
+对每个学生，测试脚本先读取其 `mlkc`、`pkc` 和 `exfr` 信息，然后对所有候选习题计算分数。
+
+### 7.1 CogRE 推荐分数
+
+对学生 $u$ 和候选习题 $e$，最终得分由两部分组成：
+
+$$
+Score(u,e)=\frac{fr_1(u,e)}{|C_u|}+fr_2(u,e)
+$$
+
+其中 $C_u$ 是学生在测试三元组中出现过的知识点集合。
+
+第一部分 $fr_1$ 来自知识点掌握程度和后续学习需求：
+
+$$
+fr_1(u,e)=\sum_{k\in C_u}\left(score(k,MLKC_{u,k},e)+score(k,PKC_{u,k},e)\right)
+$$
+
+第二部分 $fr_2$ 来自遗忘状态：
+
+$$
+fr_2(u,e)=score(e,EXFR_{u,e},e)
+$$
+
+在 CogRE 中，测试阶段必须使用和训练阶段一致的方向：
+
+$$
+diff=t'-(h'+r_m)
+$$
+
+对于候选习题得分，代码中对应的核心方向是：
 
 ```python
-akt_fpkc_h1_g08_triples.txt
+diff_mlkc = all_ex_proj.unsqueeze(0) - hr_mlkc.unsqueeze(1)
+diff_pkc = all_ex_proj.unsqueeze(0) - hr_pkc.unsqueeze(1)
+diff_efr = all_ex_proj - state_efr_rec
 ```
 
-如果要训练别的版本，比如 `h5_g08`、`h5_g09`，这里也要一起改，不然保存路径换了，但训练数据其实还是旧的。
+如果方向写反，候选题排序会发生改变，最终 `ACC@N` 和 `ZPD-EMCC@N` 也会改变。
 
 ---
 
----
+## 8. 评价指标
 
-## 1. 整体数据流
-
-`test_TransE.py` 的运行顺序大概是这样：
+当前版本重点使用两个指标：
 
 ```text
-加载模型向量
-    ↓
-读取 Q 矩阵、实体字典、关系字典
-    ↓
-读取测试三元组，整理成每个学生的 mlkc / pkc / exfr 信息
-    ↓
-用 CogRE 打分函数给每个学生的全部候选习题打分
-    ↓
-按分数排序，取前 N 道题
-    ↓
-计算 ACC@N、NOV@N、ZPD-EMCC@N
+ACC@N
+ZPD-EMCC@N
 ```
 
-几个重要的数据结构：
+其中 $N$ 通常取 `10` 和 `20`。
 
-```python
-uid_mlkc_dict[uid][kc] = "mlkc0.xx"
-```
+### 8.1 ACC@N
 
-表示模型认为学生 `uid` 对知识点 `kc` 的当前掌握程度。
+`ACC@N` 衡量推荐列表中，模型预测的学生掌握概率是否接近一个客观估计的成功概率。这里的 `ACC` 不是传统分类准确率，而是推荐列表上的预测一致性指标。
 
-```python
-uid_pkc_dict[uid][kc] = "pkc0.xx"
-```
-
-表示学生 `uid` 对知识点 `kc` 的后续学习需求。这个值在 `EMCC` 里会作为权重。
-
-```python
-uid_exfr_dict[uid][ex] = "exfr0.xx"
-```
-
-表示学生 `uid` 对历史习题 `ex` 的遗忘状态。
-
-```python
-Q[exercise_id]
-```
-
-是习题到知识点的映射。也就是一道题包含哪些知识点。
-
-```python
-exercise_df_dict[exercise_id]
-```
-
-是题目的历史正确率。正确率越低，题目越难。
-
-```python
-student_kc_acc[uid][kc]
-```
-
-是学生在某个知识点上的历史正确率，用来估计学生真实能力。
-
----
-
-## 2. 候选习题怎么打分
-
-打分这一步不是评价指标本身，它只是先给每个学生生成一个推荐列表。后面的 `ACC` 和 `EMCC` 都是在这个推荐列表上算的。
-
-CogRE 里把关系向量切成四段：
-
-$$
-r = [r_h, r_t, r_m, r_{res}]
-$$
-
-头实体投影：
-
-$$
-\phi_h(x,r)=x\odot(\sigma(r_h)+0.2\sigma(r_{res}))+r_m
-$$
-
-尾实体投影：
-
-$$
-\phi_t(x,r)=x\odot(\sigma(r_t)+0.2\sigma(r_{res}))
-$$
-
-非对称 L1 距离：
-
-$$
-d(a,b)=\sum_j
-\begin{cases}
-|a_j-b_j|, & a_j-b_j>0 \\
-\alpha |a_j-b_j|, & a_j-b_j\le 0
-\end{cases}
-$$
-
-代码里：
-
-```python
-COGRE_ALPHA = 0.4
-GAMMA = 12.0
-
-def calc_alpha_l1(diff_tensor, alpha=COGRE_ALPHA):
-    abs_diff = torch.abs(diff_tensor)
-    penalty = torch.where(diff_tensor > 0, abs_diff, alpha * abs_diff)
-    return torch.sum(penalty, dim=-1)
-```
-
-对某个学生 `u` 和某道候选题 `e`，最终分数由两部分组成：
-
-```text
-fr1：知识点掌握度和学习需求带来的推荐分
-fr2：历史习题遗忘状态带来的推荐分
-```
-
-公式可以写成：
-
-$$
-score(u,e)=\frac{fr1(u,e)}{|C_u|}+fr2(u,e)
-$$
-
-其中 `C_u` 是学生已有记录里的知识点集合。
-
-代码核心逻辑是：
-
-```python
-hr_mlkc = apply_cogre_head(concept_embeddings, mlkc_embeddings)
-hr_pkc = apply_cogre_head(concept_embeddings, pkc_embeddings)
-
-all_exercise_projection = apply_cogre_tail(all_exercise_embeddings, rec_embedding)
-
-dist_mlkc = calc_alpha_l1(hr_mlkc.unsqueeze(1) - all_exercise_projection.unsqueeze(0))
-dist_pkc = calc_alpha_l1(hr_pkc.unsqueeze(1) - all_exercise_projection.unsqueeze(0))
-
-fr1 = (GAMMA - dist_mlkc).sum(dim=0) + (GAMMA - dist_pkc).sum(dim=0)
-
-state_efr = apply_cogre_head(all_exercise_embeddings, exfr_embeddings)
-state_efr_rec = apply_cogre_head(state_efr, rec_embedding)
-
-dist_efr = calc_alpha_l1(state_efr_rec - all_exercise_projection)
-fr2 = GAMMA - dist_efr
-
-final_scores = (fr1 / concept_count) + fr2
-```
-
-得到 `final_scores` 后，对每个学生按分数从高到低排序，取前 `N` 道题。
-
----
-
-## 3. ACC@N 是怎么算的
-
-这里的 `ACC` 不是传统二分类准确率。它的意思是：
-
-> 推荐出来的题目，模型预测的掌握概率，和一个比较客观的 IRT 估计概率有多接近。
-
-对学生 `u` 推荐出的前 `N` 道题记为：
+对学生 $u$，模型推荐的前 $N$ 道题记为：
 
 $$
 S_u^N
 $$
 
-对其中一道题 `e`，它涉及的知识点集合是：
+对其中一道题 $e$，其知识点集合为 $K_e$。
+
+#### 8.1.1 题目客观难度
+
+离线统计文件 `raw_stats_akt.pkl` 中保存了：
+
+```python
+exercise_df_dict
+```
+
+其中 $df_e$ 表示习题 $e$ 的客观正确率估计。当前预处理逻辑中，$df_e$ 主要由该题涉及知识点的历史正确率通过 Q 矩阵聚合得到：
 
 $$
-K_e
+df_e=\frac{1}{|K_e|}\sum_{k\in K_e}df_k
 $$
 
-### 3.1 先算题目难度
+其中 $df_k$ 是知识点 $k$ 的历史正确率。如果某个知识点缺少历史统计，则使用全局平均正确率作为兜底。
 
-代码里 `df_e` 是题目历史正确率，所以题目难度定义为：
+题目难度定义为：
 
 $$
-d_e = 1 - df_e
+d_e=1-df_e
 $$
 
-然后转成 IRT 里的难度参数：
+为了避免 logit 发散，代码会进行裁剪：
+
+$$
+df_e\leftarrow clip(df_e,0.05,0.95)
+$$
+
+再转为 IRT 难度参数：
 
 $$
 b_e=\log\frac{d_e}{1-d_e}
 $$
 
-代码：
+#### 8.1.2 学生客观能力
 
-```python
-df_e = exercise_df_dict.get(exercise_id, global_df_mean)
-df_e_safe = np.clip(df_e, 0.05, 0.95)
-
-difficulty = 1.0 - df_e_safe
-b_e = np.log(difficulty / (1.0 - difficulty))
-```
-
-### 3.2 再算学生对这道题的客观能力
-
-如果一道题包含多个知识点，就取学生在这些知识点上的历史正确率平均值：
-
-$$
-H_{u,e}=\frac{1}{|K_e|}\sum_{k\in K_e}H_{u,k}
-$$
-
-再转成能力参数：
-
-$$
-\theta_{u,e}=\log\frac{H_{u,e}}{1-H_{u,e}}
-$$
-
-代码：
-
-```python
-history = student_kc_acc.get(str(uid), {})
-student_ability = sum(
-    history.get(concept_id, global_history_mean)
-    for concept_id in concept_ids
-) / concept_count
-
-ability_safe = np.clip(student_ability, 0.05, 0.95)
-theta_ie = np.log(ability_safe / (1.0 - ability_safe))
-```
-
-### 3.3 得到 IRT 客观成功概率
-
-$$
-P^{obj}_{u,e}=\sigma(\theta_{u,e}-b_e)
-$$
-
-也就是：
-
-```python
-objective_success_prob = 1.0 / (1.0 + np.exp(-(theta_ie - b_e)))
-```
-
-### 3.4 再算模型自己的掌握预测
-
-模型预测来自 `mlkc`。如果一道题有多个知识点，就用几何平均：
-
-$$
-P^{model}_{u,e}=\left(\prod_{k\in K_e}MLKC_{u,k}\right)^{\frac{1}{|K_e|}}
-$$
-
-代码：
-
-```python
-model_mastery_product = 1.0
-for concept_id in concept_ids:
-    concept_key = f"kc{concept_id}"
-    prob = float(user_mlkc[concept_key].replace("mlkc", ""))
-    model_mastery_product *= prob
-
-predicted_mastery = model_mastery_product ** (1.0 / concept_count)
-```
-
-### 3.5 最后算 ACC@N
-
-每道题的得分是：
-
-$$
-1-|P^{obj}_{u,e}-P^{model}_{u,e}|
-$$
-
-越接近 1，说明模型预测越贴近客观估计。
-
-所以单个学生的 `ACC@N` 是：
-
-$$
-ACC_u@N=\frac{1}{N}\sum_{e\in S_u^N}\left(1-|P^{obj}_{u,e}-P^{model}_{u,e}|\right)
-$$
-
-最后对所有测试学生求均值和标准差：
-
-$$
-ACC@N=mean_u(ACC_u@N)
-$$
-
-代码：
-
-```python
-diff_sum += 1.0 - np.abs(objective_success_prob - predicted_mastery)
-acc_values.append(diff_sum / n)
-
-return np.mean(acc_values), np.std(acc_values)
-```
-
----
-
-## 4. ZPD-EMCC@N 是怎么算的
-
-`EMCC` 关注的是：
-
-> 推荐列表能不能覆盖学生真正需要补的知识点，而且这些题是不是适合当前学生做。
-
-它不是只看推荐题目多不多，而是看推荐列表对学生后续学习的预期收益。
-
-对学生 `u`，推荐列表还是：
-
-$$
-S_u^N
-$$
-
-最终公式是：
-
-$$
-EMCC_u@N=\sum_{k\in K(S_u^N)}PKC_{u,k}\cdot f_{u,k}(S_u^N)
-$$
-
-其中：
-
-```text
-PKC_{u,k}：学生对知识点 k 的后续学习需求
-f_{u,k}(S)：推荐列表 S 对知识点 k 的联合覆盖效果
-```
-
-### 4.1 先算题目适切度
-
-题目难度仍然来自历史正确率：
-
-$$
-b^{norm}_e=1-df_e
-$$
-
-学生对这道题相关知识点的综合能力是：
-
-$$
-H_{u,e}=\frac{1}{|K_e|}\sum_{k\in K_e}H_{u,k}
-$$
-
-题目适切度：
-
-$$
-Suit_{u,e}=1-|H_{u,e}-b^{norm}_e|
-$$
-
-意思很简单：学生能力和题目难度越接近，这道题越适合他。
-
-代码：
-
-```python
-normalized_difficulty = 1.0 - df_e_safe
-
-exercise_ability = sum(
-    history.get(concept_id, global_history_mean)
-    for concept_id in concept_ids
-) / concept_count
-
-appropriateness = 1.0 - np.abs(exercise_ability_safe - normalized_difficulty)
-```
-
-### 4.2 再算单题对知识点的习得贡献
-
-对题目 `e` 里的某个知识点 `k`，学生当前掌握度是：
+学生在知识点 $k$ 上的历史能力记为：
 
 $$
 H_{u,k}
 $$
 
-单题习得贡献定义为：
+对于习题 $e$，学生的题目级能力取该题相关知识点的平均值：
 
 $$
-\alpha_{u,e,k}=\sigma(\gamma_s(Suit_{u,e}-H_{u,k}))
+H_{u,e}=\frac{1}{|K_e|}\sum_{k\in K_e}H_{u,k}
 $$
 
-代码里：
+同样进行裁剪后，转为 IRT 能力参数：
+
+$$
+\theta_{u,e}=\log\frac{H_{u,e}}{1-H_{u,e}}
+$$
+
+#### 8.1.3 客观成功概率
+
+基于 IRT 思路，学生 $u$ 做对习题 $e$ 的客观成功概率为：
+
+$$
+P^{obj}_{u,e}=\sigma(\theta_{u,e}-b_e)
+$$
+
+其中 $\sigma(\cdot)$ 是 Sigmoid 函数。
+
+#### 8.1.4 模型预测掌握概率
+
+模型端使用 `MLKC` 表示学生对知识点的预测掌握程度。对于多知识点习题，使用几何平均得到题目级预测掌握概率：
+
+$$
+P^{model}_{u,e}=\left(\prod_{k\in K_e}MLKC_{u,k}\right)^{1/|K_e|}
+$$
+
+如果某个知识点缺少 `MLKC`，使用学生历史全局均值作为兜底。
+
+#### 8.1.5 ACC@N 公式
+
+单个学生的 `ACC@N` 定义为：
+
+$$
+ACC_u@N=\frac{1}{N}\sum_{e\in S_u^N}\left(1-\left|P^{obj}_{u,e}-P^{model}_{u,e}\right|\right)
+$$
+
+整体结果对所有测试学生求均值和标准差：
+
+$$
+ACC@N=Mean_u(ACC_u@N)
+$$
+
+该指标越高，说明模型对学生掌握状态的预测越接近客观估计。
+
+### 8.2 ZPD-EMCC@N
+
+`ZPD-EMCC@N` 用来衡量推荐列表的学习收益。它关注两个问题：
+
+```text
+1. 推荐题是否覆盖了学生后续真正需要学习的知识点。
+2. 推荐题的难度是否适合学生当前能力水平。
+```
+
+对学生 $u$ 的前 $N$ 道推荐题，记为：
+
+$$
+S_u^N
+$$
+
+推荐列表覆盖到的知识点集合为：
+
+$$
+K(S_u^N)=\bigcup_{e\in S_u^N}K_e
+$$
+
+#### 8.2.1 题目适切度
+
+题目归一化难度定义为：
+
+$$
+b^{norm}_e=1-df_e
+$$
+
+学生对习题 $e$ 的综合能力为：
+
+$$
+H_{u,e}=\frac{1}{|K_e|}\sum_{k\in K_e}H_{u,k}
+$$
+
+题目适切度定义为：
+
+$$
+Suit_{u,e}=1-|H_{u,e}-b^{norm}_e|
+$$
+
+当学生能力和题目难度接近时，$Suit_{u,e}$ 更高；当题目过难或过易时，$Suit_{u,e}$ 会降低。这个设计对应教育中的 ZPD 思想，即题目应尽量落在学生当前能力附近，而不是过于简单或过于困难。
+
+#### 8.2.2 单题知识点习得率
+
+对习题 $e$ 中的知识点 $k$，单题带来的习得贡献定义为：
+
+$$
+\alpha_{u,e,k}=\sigma\left(\gamma_s(Suit_{u,e}-H_{u,k})\right)
+$$
+
+其中 $\gamma_s$ 是缩放系数，当前代码中取：
 
 $$
 \gamma_s=2.0
 $$
 
-直观理解：
+这个公式的含义是：当题目适切度高，且学生对该知识点尚未充分掌握时，推荐该题更可能带来有效学习收益。
 
-```text
-题目越适合学生，alpha 越大；
-学生已经很熟的知识点，alpha 会被压低；
-学生还没掌握、但题目难度又比较合适，alpha 会更高，这个要不要暂时没决定
-```
+#### 8.2.3 多题联合覆盖
 
-代码：
-
-```python
-gamma_scale = 2.0
-
-concept_mastery = history.get(concept_id, global_history_mean)
-concept_mastery_safe = np.clip(concept_mastery, 0.05, 0.95)
-
-logit = gamma_scale * (appropriateness - concept_mastery_safe)
-alpha_iek = 1.0 / (1.0 + np.exp(-logit))
-
-concept_alphas[concept_id].append(alpha_iek)
-```
-
-### 4.3 多道题覆盖同一个知识点时，做边际收益递减
-
-如果推荐列表里有多道题都覆盖知识点 `k`，不是简单相加，而是用指数函数压一下：
+如果推荐列表中多道题覆盖同一个知识点，收益不应简单线性累加。为体现边际收益递减，对知识点 $k$ 的联合覆盖函数定义为：
 
 $$
-f_{u,k}(S)=1-\exp\left(-\beta\sum_{e\in S_k}\alpha_{u,e,k}\right)
+f_{u,k}(S_u^N)=1-\exp\left(-\beta\sum_{e\in S_u^N, k\in K_e}\alpha_{u,e,k}\right)
 $$
 
-代码里：
+当前代码中：
 
 $$
 \beta=1.0
 $$
 
-这样做的原因是：同一个知识点推荐太多题，收益会逐渐饱和，不会无限增加。
+当同一知识点被多道题覆盖时，$f_{u,k}$ 会逐渐接近 1，但不会无限增大。
 
-代码：
+#### 8.2.4 PKC 加权的学习收益
 
-```python
-f_k_s = 1.0 - np.exp(-beta * np.sum(alphas))
-```
-
-### 4.4 最后乘上 PKC，得到 EMCC
-
-`PKC` 是学生对某个知识点的后续学习需求。需求越高，这个知识点的覆盖越重要。
+`PKC` 表示学生对知识点 $k$ 的后续学习需求。最终的原始 EMCC 分数为：
 
 $$
-EMCC_u@N=\sum_k PKC_{u,k}\cdot f_{u,k}(S_u^N)
+EMCC^{raw}_u@N=\sum_{k\in K(S_u^N)}PKC_{u,k}\cdot f_{u,k}(S_u^N)
 $$
 
-代码：
+该分数是加权求和，因此不限定在 $[0,1]$。如果推荐列表覆盖了多个高需求知识点，`EMCC(raw)` 可以大于 1。
+
+为了便于观察推荐列表内部覆盖质量，也可以计算局部归一化版本：
+
+$$
+EMCC^{local}_u@N=\frac{EMCC^{raw}_u@N}{\sum_{k\in K(S_u^N)}PKC_{u,k}+\epsilon}
+$$
+
+其中分母只使用推荐列表实际覆盖到的知识点的 `PKC` 质量，而不是学生所有知识点的 `PKC` 总量。这个局部归一化版本更适合解释“当前推荐列表覆盖到的知识点质量如何”。
+
+最终对所有学生求均值和标准差：
+
+$$
+ZPD\text{-}EMCC@N=Mean_u(EMCC_u@N)
+$$
+
+### 8.3 ACC 和 ZPD-EMCC 的区别
+
+`ACC@N` 关注模型判断是否准确：
+
+```text
+模型预测的掌握概率是否接近客观 IRT 成功概率。
+```
+
+`ZPD-EMCC@N` 关注推荐是否有学习价值：
+
+```text
+推荐列表是否覆盖学生未来需要学习的知识点，并且题目难度是否适合当前学生。
+```
+
+两者并不完全等价。只推荐很简单的题，模型可能更容易判断学生能做对，`ACC` 可能较高，但学习收益不一定高。推荐更贴近学生最近发展区的题，`EMCC` 往往更能体现推荐列表的教育价值。
+
+---
+
+## 9. 代码结构
+
+项目主要文件结构如下：
+
+```text
+KG4EX/
+├── README.md
+├── requirements.txt
+├── codes/
+│   ├── dataloader.py
+│   ├── model.py
+│   ├── run.py
+│   └── test_models.py
+├── data/
+│   └── algebra2005/
+│       ├── Q.txt
+│       ├── entities.dict
+│       ├── relations.dict
+│       ├── generate_dict.py
+│       ├── build_stats.py
+│       └── raw_stats_akt.pkl
+└── pyKT_example/
+    └── output_final_akt_fpkc_h5_g09.csv
+```
+
+其中：
+
+| 文件 | 作用 |
+|---|---|
+| `codes/model.py` | 定义 TransE、TripleRE、CogRE 等嵌入模型 |
+| `codes/dataloader.py` | 负责正负样本构造和 DataLoader 数据组织 |
+| `codes/run.py` | 训练入口，负责读取字典、三元组、训练模型并保存 checkpoint |
+| `codes/test_models.py` | 统一测试入口，支持 CogRE、TripleRE 和 TransE-ADV |
+| `data/algebra2005/generate_dict.py` | 根据 train/test triples 生成实体和关系字典 |
+| `data/algebra2005/build_stats.py` | 根据 pyKT 输出 CSV 和 Q 矩阵生成离线评价统计 |
+| `data/algebra2005/Q.txt` | 习题-知识点矩阵 |
+| `data/algebra2005/raw_stats_akt.pkl` | ACC 和 EMCC 使用的离线题目正确率估计 |
+
+---
+
+## 10. 运行流程
+
+### 10.1 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 10.2 生成字典
+
+进入数据目录：
+
+```bash
+cd data/algebra2005
+```
+
+根据训练和测试三元组生成字典：
+
+```bash
+python generate_dict.py \
+  --train_file akt_fpkc_h5_g09_triples.txt \
+  --test_file akt_fpkc_h5_g09_test_triples.txt
+```
+
+该脚本会生成：
+
+```text
+entities.dict
+relations.dict
+```
+
+### 10.3 生成离线评价统计
+
+```bash
+python build_stats.py \
+  --csv_path ../../pyKT_example/output_final_akt_fpkc_h5_g09.csv \
+  --q_file Q.txt
+```
+
+该脚本会生成：
+
+```text
+raw_stats_akt.pkl
+```
+
+其中包含：
 
 ```python
-expected_coverage = 0.0
+exercise_df_dict
+global_df_mean
+```
 
-for concept_id, alphas in concept_alphas.items():
-    concept_key = f"kc{concept_id}"
-    pkc_value = float(user_pkc[concept_key].replace("pkc", ""))
+### 10.4 训练 CogRE
 
-    f_k_s = 1.0 - np.exp(-beta * np.sum(alphas))
-    expected_coverage += pkc_value * f_k_s
+进入代码目录：
 
-emcc_values.append(expected_coverage)
+```bash
+cd ../../codes
+```
 
-return np.mean(emcc_values), np.std(emcc_values)
+运行训练：
+
+```bash
+python run.py --do_train --cuda \
+  --data_path ../data/algebra2005 \
+  --save_path ./models/algebra2005/cog_h5_g09 \
+  --model CogRE \
+  -b 512 \
+  -n 128 \
+  -d 500 \
+  -r 0.00 \
+  -lr 0.001 \
+  -cpu 20 \
+  -3u 1.0 \
+  --max_steps 30000 \
+  -adv
+```
+
+如果希望训练更快并减少频繁保存，可以使用：
+
+```bash
+python -u run.py --do_train --cuda \
+  --data_path ../data/algebra2005 \
+  --save_path ./models/algebra2005/cog_h5_g09 \
+  --model CogRE \
+  -b 512 \
+  -n 128 \
+  -d 500 \
+  -r 0.00 \
+  -lr 0.001 \
+  -cpu 20 \
+  -3u 1.0 \
+  --max_steps 30000 \
+  -adv \
+  --save_checkpoint_steps 5000 \
+  --log_steps 500
+```
+
+### 10.5 测试 CogRE
+
+```bash
+python test_models.py \
+  --model_type cogre \
+  --embedding_path ./models/algebra2005/cog_h5_g09
+```
+
+### 10.6 测试 TripleRE
+
+```bash
+python test_models.py \
+  --model_type triplere \
+  --embedding_path ./models/algebra2005/triplere_h5_g09 \
+  --triplere_u 1.0
+```
+
+如果训练 TripleRE 时使用的是其他 `u` 值，测试时必须保持一致。
+
+### 10.7 测试 TransE-ADV
+
+```bash
+python test_models.py \
+  --model_type transe_adv \
+  --embedding_path ./models/algebra2005/transe_adv_h5_g09
 ```
 
 ---
 
-## 5. ACC 和 EMCC 的区别
+## 11. 注意事项
 
-`ACC` 看的是：
+1. `entities.dict` 和 `relations.dict` 必须和训练模型时使用的字典保持一致。模型 embedding 的行号依赖字典 ID，如果训练后重新生成字典，可能导致测试时读取错 embedding。
 
-```text
-模型对学生掌握度的预测，和客观 IRT 估计是否接近。
-```
+2. `test_models.py` 中的 CogRE 评分方向必须与 `model.py` 一致。当前方向为：
 
-所以 `ACC` 越高，说明推荐列表里的题，模型对学生能不能做对的判断越稳。
+   $$
+   diff=t'-(h'+r_m)
+   $$
 
-`EMCC` 看的是：
+3. `raw_stats_akt.pkl` 应当由与当前实验匹配的 pyKT 输出 CSV 生成。如果训练和测试使用的是 `h5_g09`，则离线统计也应使用相同版本的数据源。
 
-```text
-推荐列表能不能覆盖学生未来真正需要补的知识点，并且题目难度是否合适。
-```
-
-所以 `EMCC` 越高，说明推荐列表更有学习收益，更像是在帮学生补短板。
-
-简单说：
-
-```text
-ACC：推荐是否“判断准确”
-EMCC：推荐是否“有学习价值”
-```
-
-这两个指标不一定同时升高。比如推荐很多很简单的题，`ACC` 可能不错，但 `EMCC` 不一定高；推荐更有挑战、刚好卡在学生薄弱点上的题，`EMCC` 可能更高，但 `ACC` 可能会波动。
+4. 大规模数据文件和训练好的 checkpoint 通常不建议直接上传到 GitHub。仓库中可以保留脚本、README、示例数据和必要的小型配置文件。
 
 ---
 
-## 6. 现在代码里打印结果的格式，test_TransE3.py 里的是改进版的test,test_TransE.py是老版
+## 12. 当前阶段成果
 
-现在打印会比较简洁：
+目前，本项目已经完成了从学生特征提取、知识图谱构建、嵌入模型训练到推荐效果评价的完整实验流程。相比原始 KG4EER 流程，本项目主要在两个方面进行了改进。
 
-```text
-Loading data...
-Scoring candidates...
-Candidate scoring complete.
-Calculating ACC...
-n=10 | ACC mean=0.xxxx, std=0.xxxx
-n=20 | ACC mean=0.xxxx, std=0.xxxx
-Calculating NOV...
-n=10 | NOV mean=0.xxxx, std=0.xxxx
-n=20 | NOV mean=0.xxxx, std=0.xxxx
-Calculating ZPD-EMCC...
-n=10 | ZPD-EMCC mean=0.xxxx, std=0.xxxx
-n=20 | ZPD-EMCC mean=0.xxxx, std=0.xxxx
-```
+首先，在学生特征提取阶段，项目引入了基于 Transformer 架构的序列建模方法，用于提取学生在历史学习过程中的知识掌握状态、后续知识点需求以及遗忘相关特征。相比传统序列模型，Transformer 能够更好地捕捉长距离学习行为之间的依赖关系，使学生状态表示更加充分。
 
-不会再打一堆横线和符号。
+其次，在知识图谱嵌入阶段，项目设计并使用了 CogRE 模型。该模型在关系建模时引入了关系门控和非对称距离度量，使不同类型的教育关系能够以更细粒度的方式影响实体表示。对于 `mlkc`、`pkc`、`exfr` 和 `rec` 这类具有明确教育语义的关系，CogRE 能够比普通平移模型更灵活地表示学生、知识点和习题之间的关联。
 
----
+在评价方面，项目不再只依赖传统推荐指标，而是重点使用 `ACC@N` 和 `ZPD-EMCC@N` 两个与教育推荐目标更一致的指标。`ACC@N` 关注模型预测的学生掌握概率是否接近客观 IRT 估计结果；`ZPD-EMCC@N` 则关注推荐列表是否覆盖学生真正需要学习的知识点，并考虑题目难度与学生当前能力之间的适切性。因此，这两个指标不仅衡量推荐结果是否“准确”，也进一步衡量推荐内容是否具有潜在学习收益。
 
-## 7. 跑代码前要确认的路径
+当前实验结果表明，改进后的流程在 `ACC` 和 `ZPD-EMCC` 两个核心指标上均表现出优于原始模型的趋势。这说明基于 Transformer 的学生特征提取、改进后的 CogRE 嵌入建模，以及面向教育收益的评价指标设计，能够更好地服务于个性化习题推荐任务。
 
-`test_TransE.py` 顶部有这些路径：
-
-```python
-DATA_PATH = Path("../data/algebra2005")
-EMBEDDING_PATH = Path("./models/algebra2005/cog_h1_g08")
-TEST_TRIPLES_PATH = DATA_PATH / "akt_fpkc_h1_g08_test_triples.txt"
-OFFLINE_STATS_PATH = DATA_PATH / "raw_stats_akt.pkl"
-STUDENT_HISTORY_PATH = Path("../pyKT_example/output_final_akt.csv")
-UID_KC_RESPONSE_PATH = DATA_PATH / "algebra2005_uid_kc_response.txt"
-```
-
-换实验的时候，一般要改这两个：
-
-```python
-EMBEDDING_PATH = Path("./models/algebra2005/你的模型目录")
-TEST_TRIPLES_PATH = DATA_PATH / "你的测试三元组文件.txt"
-```
-
-比如从 `h1_g08` 换成 `h5_g09`，就要保证模型目录和测试三元组文件是一套的，不然结果会对不上。
+需要说明的是，完整训练结果和多组实验对比仍在整理中，后续将进一步补充不同模型、不同参数设置下的详细数值结果。

@@ -62,9 +62,15 @@ class TrainDataset(Dataset):
         negative_sample = torch.LongTensor(negative_sample)
 
         positive_sample = torch.LongTensor(positive_sample)
+<<<<<<< HEAD
             
         return positive_sample, negative_sample, subsampling_weight, self.mode
     
+=======
+
+        return positive_sample, negative_sample, subsampling_weight, self.mode
+
+>>>>>>> 36b6bc4 (release: update KG4EX v1.1.0)
     @staticmethod
     def collate_fn(data):
         positive_sample = torch.stack([_[0] for _ in data], dim=0)

@@ -189,6 +189,10 @@ def main(args):
         for line in fin:
             rid, relation = line.strip().split('\t')
             relation2id[relation] = int(rid)
+<<<<<<< HEAD
+=======
+
+>>>>>>> 36b6bc4 (release: update KG4EX v1.1.0)
     
     # Read regions for Countries S* datasets
     if args.countries:
@@ -210,7 +214,11 @@ def main(args):
     logging.info('#entity: %d' % nentity)
     logging.info('#relation: %d' % nrelation)
 
+<<<<<<< HEAD
     train_triples = read_triple(os.path.join(args.data_path, 'akt_fpkc_h1_g08_triples.txt'), entity2id, relation2id)
+=======
+    train_triples = read_triple(os.path.join(args.data_path, 'akt_fpkc_h5_g09_triples.txt'), entity2id, relation2id)
+>>>>>>> 36b6bc4 (release: update KG4EX v1.1.0)
     logging.info('#train: %d' % len(train_triples))
 
     kge_model = KGEModel(
@@ -292,7 +300,11 @@ def main(args):
     # Set valid dataloader as it would be evaluated during training
     
     if args.do_train:
+<<<<<<< HEAD
         logging.info('learning_rate = %d' % current_learning_rate)
+=======
+        logging.info('learning_rate = %f' % current_learning_rate)
+>>>>>>> 36b6bc4 (release: update KG4EX v1.1.0)
 
         training_logs = []
         
